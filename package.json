@@ -1,5 +1,5 @@
 {
-  "name": "@lastolivegames/becsy",
+  "name": "@antarien/aecsy",
   "type": "module",
   "version": "0.16.0",
   "scripts": {
@@ -28,7 +28,7 @@
   "engines": {
     "node": ">=12"
   },
-  "repository": "git@github.com:lastolivegames/becsy.git",
+  "repository": "git@github.com:antarien/aecsy.git",
   "author": "Piotr Kaminski <piotr@lastolive.games>",
   "license": "MIT",
   "devDependencies": {
