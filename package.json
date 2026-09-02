@@ -9,6 +9,7 @@
     "deopt": "rm *.log && node --trace-ic --enable-source-maps --es-module-specifier-resolution=node lib/tests/performance.test.js && mv *.log v8.pre.log && node striplog.cjs && deoptigate",
     "flame": "clinic flame -- node --enable-source-maps --es-module-specifier-resolution=node lib/tests/performance.test.js",
     "build": "rollup --config",
+    "prepare": "rollup --config",
     "prepublishOnly": "yarn build",
     "release": "node build/release.js",
     "lint": "eslint src tests benchmarks eslint.config.mjs",
