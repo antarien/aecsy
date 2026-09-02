@@ -10,7 +10,7 @@ import {Log, type LogPointer} from './datatypes/log';
 import {SharedAtomicPool, type Uint32Pool, UnsharedPool} from './datatypes/intpool';
 import type {Dispatcher} from './dispatcher';
 import {type Entity, type EntityId, EntityImpl} from './entity';
-import {COMPONENT_ID_MASK, ENTITY_ID_BITS, ENTITY_ID_MASK} from './consts';
+import {LOG_ENTRY_WORDS} from './consts';
 import type {SystemBox} from './system';
 import {AtomicSharedShapeArray, type ShapeArray, UnsharedShapeArray} from './datatypes/shapearray';
 import {CheckError, InternalError} from './errors';
@@ -332,10 +332,10 @@ export class Registry {
       [log, startIndex, endIndex] =
         this.removalLog.processSince(this.oldRemovalPointer, this.prevRemovalPointer);
       if (!log) break;
-      for (let i = startIndex!; i < endIndex!; i++) {
-        const entry = log[i];
-        const entityId = (entry & ENTITY_ID_MASK) as EntityId;
-        const componentId = (entry >>> ENTITY_ID_BITS) & COMPONENT_ID_MASK;
+      /* Entries are two words wide: the entity id, then the component type id. */
+      for (let i = startIndex!; i < endIndex!; i += LOG_ENTRY_WORDS) {
+        const entityId = log[i] as EntityId;
+        const componentId = log[i + 1];
         const type = this.types[componentId];
         if (!this.shapes.isSet(entityId, type) && !this.removedShapes.isSet(entityId, type)) {
           this.staleShapes.unset(entityId, type);
@@ -405,7 +405,7 @@ export class Registry {
     this.staleShapes.set(id, type);
     CHECK: this.reshapedEntityIds.push(id);
     if (type !== this.Alive || this.hasNegativeQueries) {
-      this.dispatcher.shapeLog.push(id | (type.id! << ENTITY_ID_BITS), type);
+      this.dispatcher.shapeLog.push(id, type.id!, type);
     }
   }
 
@@ -414,16 +414,15 @@ export class Registry {
     this.shapes.unset(id, type);
     this.removedShapes.set(id, type);
     CHECK: this.reshapedEntityIds.push(id);
-    const logEntry = id | (type.id! << ENTITY_ID_BITS);
-    this.removalLog.push(logEntry);
+    this.removalLog.push(id, type.id!);
     if (type !== this.Alive || this.hasNegativeQueries) {
-      this.dispatcher.shapeLog.push(logEntry, type);
+      this.dispatcher.shapeLog.push(id, type.id!, type);
     }
     STATS: this.dispatcher.stats.forComponent(type).numEntities -= 1;
   }
 
   trackWrite(id: EntityId, type: ComponentType<any>): void {
-    this.dispatcher.writeLog!.push(id | (type.id! << ENTITY_ID_BITS), type);
+    this.dispatcher.writeLog!.push(id, type.id!, type);
   }
 
   private clearRefs(id: EntityId, type: ComponentType<any>, final: boolean): void {

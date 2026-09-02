@@ -1,7 +1,7 @@
 import type {LogPointer} from './datatypes/log';
 import type {Dispatcher} from './dispatcher';
 import type {Entity, EntityId, AccessMasks} from './entity';
-import {COMPONENT_ID_MASK, ENTITY_ID_BITS, ENTITY_ID_MASK} from './consts';
+import {LOG_ENTRY_WORDS, RUN_HEADER_FLAG} from './consts';
 import type {World} from './world';  // eslint-disable-line @typescript-eslint/no-unused-vars
 import {Query, QueryBox, QueryBuilder} from './query';
 import {type ComponentType, declareSingleton} from './component';
@@ -505,22 +505,25 @@ export class SystemBox {
     while (true) {
       [log, startIndex, endIndex] = shapeLog.processSince(this.shapeLogPointer);
       if (!log) break;
+      /* `runLength` counts ENTRIES; the log is indexed in WORDS, so spans are scaled on use. */
       if (runLength && !queries) {
-        startIndex! += runLength;
+        startIndex! += runLength * LOG_ENTRY_WORDS;
         runLength = 0;
       }
-      for (let i = startIndex!; i < endIndex!; i++) {
-        const entry = log[i];
-        const entityId = (entry & ENTITY_ID_MASK) as EntityId;
+      for (let i = startIndex!; i < endIndex!; i += LOG_ENTRY_WORDS) {
+        const entityId = log[i] as EntityId;
+        const typeWord = log[i + 1];
         if (!queries) {
-          const typeId = (entry >>> ENTITY_ID_BITS) & COMPONENT_ID_MASK;
-          const runHeader = entry & 2 ** 31;
+          /* The marker rides in the top bit of the type word; both are read as plain unsigned
+             numbers rather than through `&`, which would coerce them to signed 32-bit. */
+          const runHeader = typeWord >= RUN_HEADER_FLAG;
+          const typeId = typeWord % RUN_HEADER_FLAG;
           queries = this.shapeQueriesByComponent[typeId];
           if (runHeader) {
             runLength = entityId;
             if (!queries) {
-              const skip = Math.min(runLength, endIndex! - i);
-              i += skip;
+              const skip = Math.min(runLength, (endIndex! - i) / LOG_ENTRY_WORDS);
+              i += skip * LOG_ENTRY_WORDS;
               runLength -= skip;
             }
             continue;
@@ -528,7 +531,7 @@ export class SystemBox {
           if (!queries) continue;
           runLength = 1;
         }
-        DEBUG: if (entry & 2 ** 31) {
+        DEBUG: if (typeWord >= RUN_HEADER_FLAG) {
           throw new InternalError('Trying to process run header as entry in shape log');
         }
         for (let j = 0; j < queries.length; j++) queries[j].handleShapeUpdate(entityId);
@@ -549,16 +552,17 @@ export class SystemBox {
     while (true) {
       [log, startIndex, endIndex] = writeLog.processSince(this.writeLogPointer!);
       if (!log) break;
+      /* `runLength` counts ENTRIES; the log is indexed in WORDS, so spans are scaled on use. */
       if (runLength && !queries) {
-        startIndex! += runLength;
+        startIndex! += runLength * LOG_ENTRY_WORDS;
         runLength = 0;
       }
-      for (let i = startIndex!; i < endIndex!; i++) {
-        const entry = log[i];
-        const entityId = (entry & ENTITY_ID_MASK) as EntityId;
+      for (let i = startIndex!; i < endIndex!; i += LOG_ENTRY_WORDS) {
+        const entityId = log[i] as EntityId;
+        const typeWord = log[i + 1];
         if (!queries) {
-          const typeId = (entry >>> ENTITY_ID_BITS) & COMPONENT_ID_MASK;
-          const runHeader = entry & 2 ** 31;
+          const runHeader = typeWord >= RUN_HEADER_FLAG;
+          const typeId = typeWord % RUN_HEADER_FLAG;
           // Manually recompute flag offset and mask instead of looking up component type.
           componentFlagOffset = typeId >> 5;
           componentFlagMask = 1 << (typeId & 31);
@@ -566,8 +570,8 @@ export class SystemBox {
           if (runHeader) {
             runLength = entityId;
             if (!queries) {
-              const skip = Math.min(runLength, endIndex! - i);
-              i += skip;
+              const skip = Math.min(runLength, (endIndex! - i) / LOG_ENTRY_WORDS);
+              i += skip * LOG_ENTRY_WORDS;
               runLength -= skip;
             }
             continue;
@@ -575,7 +579,7 @@ export class SystemBox {
           if (!queries) continue;
           runLength = 1;
         }
-        DEBUG: if (entry & 2 ** 31) {
+        DEBUG: if (typeWord >= RUN_HEADER_FLAG) {
           throw new InternalError('Trying to process run header as entry in write log');
         }
         for (let j = 0; j < queries.length; j++) {

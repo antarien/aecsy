@@ -2,9 +2,7 @@ import {checkTypeDefined, type ComponentType} from './component';
 import {Log, type LogPointer} from './datatypes/log';
 import {checkMask, type Entity, type EntityId} from './entity';
 import {
-  COMPONENT_ID_BITS, COMPONENT_ID_MASK, ENTITY_ID_BITS, ENTITY_ID_MASK, FIELD_SEQ_BITS,
-  FIELD_SEQ_MASK, MAX_NUM_COMPONENTS,
-  MAX_NUM_FIELDS
+  COMPONENT_ID_BITS, FIELD_SEQ_MASK, LOG_ENTRY_WORDS, MAX_NUM_COMPONENTS, MAX_NUM_FIELDS
 } from './consts';
 import type {Dispatcher} from './dispatcher';
 import type {Registry} from './registry';
@@ -28,6 +26,18 @@ enum Action {
 }
 
 const ACTION_MASK = Action.UNREFERENCE_AND_RELEASE;
+
+/**
+ * Log entries written per reference change: (source, its type), (target, its flags), and an
+ * optional third carrying an internal index. The log is sized by this factor so that
+ * `maxRefChangesPerFrame` means what it says.
+ */
+const REF_LOG_ENTRIES_PER_CHANGE = 3;
+
+/** Multiplier that lifts a vector-element index above the packed type and field sequence. */
+const TAG_INDEX_SPAN = MAX_NUM_COMPONENTS * MAX_NUM_FIELDS;
+/** Exact-integer headroom left for that index: 2^53 / (2^31 * 2^7). */
+const MAX_INTERNAL_INDEX = 2 ** 15;
 
 
 class Tracker {
@@ -70,9 +80,10 @@ class Tracker {
   }
 
   private clearRef(sourceId: EntityId, tag: number, final: boolean): void {
-    const sourceTypeId = tag & COMPONENT_ID_MASK;
-    const sourceSeq = (tag >>> COMPONENT_ID_BITS) & FIELD_SEQ_MASK;
-    const internalIndex = tag >>> (COMPONENT_ID_BITS + FIELD_SEQ_BITS);
+    const sourceTypeId = tag % MAX_NUM_COMPONENTS;
+    const sourceSeq = Math.floor(tag / MAX_NUM_COMPONENTS) % MAX_NUM_FIELDS;
+    const storedIndex = Math.floor(tag / TAG_INDEX_SPAN);
+    const internalIndex = storedIndex === 0 ? undefined : storedIndex - 1;
     const sourceType = this.registry.types[sourceTypeId];
     CHECK: checkMask(sourceType, this.registry.executingSystem, 'write');
     sourceType.__bind!(sourceId, true);
@@ -163,9 +174,29 @@ class Tracker {
     return !set.size;
   }
 
+  /**
+   * Pack (type, field sequence, optional element index) into one exact integer.
+   *
+   * Upstream shifted these into a 32-bit word, which only worked while a type id was 9 bits wide.
+   * With type ids spanning 31 bits the shifts fall apart silently — JS shifts count modulo 32, so
+   * `x << 38` becomes `x << 6` and an absent element index reads back as a present one.
+   *
+   * The packing is arithmetic instead, and exact: type (31 bits) and field sequence (7 bits) leave
+   * 15 bits of a double's exact integer range for the element index. That index is the position
+   * inside a VECTOR FIELD of fixed stride — a declared shape, not a runtime population — so the
+   * range is generous rather than a ceiling on anything that grows. The check below states it out
+   * loud rather than letting a wider field wrap into the field sequence.
+   *
+   * Zero now means "no element index" and a real index of 0 is stored as 1. Upstream could not
+   * tell those apart, which is why its callers test the value for truthiness.
+   */
   private makeTag(typeId: number, fieldSeq: number, internalIndex: number | undefined): number {
-    return typeId | (fieldSeq << COMPONENT_ID_BITS) |
-      (internalIndex === undefined ? 0 : (internalIndex << (COMPONENT_ID_BITS + FIELD_SEQ_BITS)));
+    CHECK: if (internalIndex !== undefined && internalIndex + 1 >= MAX_INTERNAL_INDEX) {
+      throw new CheckError(
+        `Vector field too long to index: ${internalIndex}, the limit is ${MAX_INTERNAL_INDEX - 1}`);
+    }
+    return typeId + fieldSeq * MAX_NUM_COMPONENTS +
+      (internalIndex === undefined ? 0 : (internalIndex + 1) * TAG_INDEX_SPAN);
   }
 
   private addEntity(entityId: EntityId, trackChanges: boolean): number {
@@ -220,7 +251,15 @@ export class RefIndexer {
   private refLogStatsPointer?: LogPointer;
   private readonly selectorIdsBySourceKey = new Map<number, number>();
   private readonly selectors: Selector[] = [];
-  private readonly trackers = new Map<number, Tracker>();
+  /**
+   * Selector id → (target id paired with its stale bit) → tracker.
+   *
+   * Upstream used one flat map keyed by `targetId | selectorId << ENTITY_ID_BITS | staleBit`, which
+   * only works while an entity id leaves room beside it in a 32-bit word. With ids spanning the
+   * word, that key would silently collide. Nesting keeps both axes whole and costs one lookup;
+   * the map is touched when references change, not in the per-component hot path.
+   */
+  private readonly trackers = new Map<number, Map<number, Tracker>>();
   private readonly registry: Registry;
 
   constructor(
@@ -243,9 +282,19 @@ export class RefIndexer {
     CHECK: if (targetType) checkTypeDefined(targetType);
     CHECK: if (sourceType) checkTypeDefined(sourceType);
     if (!this.refLog) {
+      /* THE PARAMETER COUNTS REF CHANGES; THE LOG COUNTS ENTRIES, AND ONE CHANGE IS UP TO THREE.
+       *
+       * Upstream passed the two straight through, so a budget of N ref changes really bought about
+       * N/3 of them. That survived on an accident: the duplicate check in `Log.push` compared a
+       * slot two positions back, which in THIS log happened to be the previous `part1` and so
+       * swallowed repeated source references. Rewriting that check to compare the last entry —
+       * what it always claimed to do — removed the accident and exposed the budget for what it was.
+       *
+       * Sizing the log for what the name promises is the fix. Restoring the accidental dedup would
+       * leave a working number resting on a wrong one. */
       this.refLog = new Log(
-        this.maxRefChangesPerFrame, 'maxRefChangesPerFrame', this.dispatcher.buffers,
-        {localProcessingAllowed: true}
+        this.maxRefChangesPerFrame * REF_LOG_ENTRIES_PER_CHANGE, 'maxRefChangesPerFrame',
+        this.dispatcher.buffers, {localProcessingAllowed: true}
       );
       this.refLogPointer = this.refLog.createPointer();
       this.refLogStatsPointer = this.refLog.createPointer();
@@ -323,10 +372,13 @@ export class RefIndexer {
         throw new InternalError('Inconsistent internally indexed flag');
       }
     }
-    this.refLog!.push(sourceId | (sourceType.id! << ENTITY_ID_BITS));
-    this.refLog!.push(
-      targetId | (sourceSeq << ENTITY_ID_BITS) | action | (internallyIndexed ? 2 ** 29 : 0));
-    if (internallyIndexed) this.refLog!.push(sourceInternalIndex!);
+    /* Two entries per reference, each two words wide: (source, its type) then (target, its flags).
+     * The flag word carries the field sequence, the action and the internally-indexed marker side
+     * by side — no shift is needed for them, because they occupy disjoint bit ranges and the word
+     * is theirs alone. A third entry follows only when an internal index has to be carried. */
+    this.refLog!.push(sourceId, sourceType.id!);
+    this.refLog!.push(targetId, sourceSeq | action | (internallyIndexed ? 2 ** 29 : 0));
+    if (internallyIndexed) this.refLog!.push(sourceInternalIndex!, 0);
     this.processEntry(
       sourceId, sourceType.id!, sourceSeq, sourceInternalIndex, targetId, action, true
     );
@@ -340,16 +392,25 @@ export class RefIndexer {
     }
     let staleTracker: Tracker;
     tracker = new Tracker(targetId, selector, false, this.dispatcher);
-    this.trackers.set(targetId | (selector.id << ENTITY_ID_BITS), tracker);
+    this.trackerBucket(selector).set(targetId * 2, tracker);
     if (selector.trackStale) {
       staleTracker = new Tracker(targetId, selector, true, this.dispatcher);
-      this.trackers.set(targetId | (selector.id << ENTITY_ID_BITS) | 2 ** 31, staleTracker);
+      this.trackerBucket(selector).set(targetId * 2 + 1, staleTracker);
     }
     return stale ? staleTracker! : tracker;
   }
 
+  private trackerBucket(selector: Selector): Map<number, Tracker> {
+    let bucket = this.trackers.get(selector.id);
+    if (!bucket) {
+      bucket = new Map<number, Tracker>();
+      this.trackers.set(selector.id, bucket);
+    }
+    return bucket;
+  }
+
   private getTracker(selector: Selector, targetId: EntityId, stale: boolean): Tracker | undefined {
-    return this.trackers.get(targetId | (selector.id << ENTITY_ID_BITS) | (stale ? 2 ** 31 : 0));
+    return this.trackers.get(selector.id)?.get(targetId * 2 + (stale ? 1 : 0));
   }
 
   flush(): void {
@@ -359,16 +420,17 @@ export class RefIndexer {
         this.refLog.processAndCommitSince(this.refLogPointer!);
       if (!log) break;
       if (local) continue;
-      for (let i = startIndex!; i < endIndex!; i += 2) {
-        const entryPart1 = log[i], entryPart2 = log[i + 1];
-        const sourceId = (entryPart1 & ENTITY_ID_MASK) as EntityId;
-        const sourceTypeId = entryPart1 >>> ENTITY_ID_BITS;
-        const targetId = (entryPart2 & ENTITY_ID_MASK) as EntityId;
-        const sourceSeq = (entryPart2 >>> ENTITY_ID_BITS) & (MAX_NUM_FIELDS - 1);
-        const action: Action = entryPart2 & ACTION_MASK;
-        const internallyIndexed = (entryPart2 & 2 ** 29) !== 0;
-        const internalIndex = internallyIndexed ? log[i + 2] : undefined;
-        if (internallyIndexed) i += 1;
+      /* One reference spans two entries, i.e. four words: source, source type, target, flags. */
+      for (let i = startIndex!; i < endIndex!; i += 2 * LOG_ENTRY_WORDS) {
+        const sourceId = log[i] as EntityId;
+        const sourceTypeId = log[i + 1];
+        const targetId = log[i + 2] as EntityId;
+        const flags = log[i + 3];
+        const sourceSeq = flags & FIELD_SEQ_MASK;
+        const action: Action = flags & ACTION_MASK;
+        const internallyIndexed = (flags & 2 ** 29) !== 0;
+        const internalIndex = internallyIndexed ? log[i + 4] : undefined;
+        if (internallyIndexed) i += LOG_ENTRY_WORDS;
         this.processEntry(
           sourceId, sourceTypeId, sourceSeq, internalIndex, targetId, action, false
         );

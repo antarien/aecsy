@@ -1,6 +1,6 @@
 import type {ComponentType} from '../component';
 import type {Buffers} from '../buffers';
-import {ENTITY_ID_BITS} from '../consts';
+import {LOG_ENTRY_WORDS, RUN_HEADER_FLAG} from '../consts';
 import {CheckError, InternalError} from '../errors';
 
 
@@ -23,17 +23,33 @@ const EMPTY_TUPLE: [] = [];
 
 
 /**
- * A circular log of u32 numbers with smart pointers into it.  When the log wraps around it
- * increments a generation counter so you can tell if your pointer got lapped and is now invalid.
+ * A circular log of (entity, component type) pairs with smart pointers into it.  When the log
+ * wraps around it increments a generation counter so you can tell if your pointer got lapped and
+ * is now invalid.
+ *
+ * ONE ENTRY OCCUPIES TWO SLOTS, AND THAT IS THE POINT OF THIS FORK. Upstream squeezed the pair and
+ * a marker bit into a single 32-bit word, which capped a world at 512 component classes and 4.19M
+ * entities. Here the entity gets a full word and the type gets its own, so neither axis pays for
+ * the other (see `consts.ts`).
+ *
+ * ALL INDICES IN THIS CLASS COUNT WORDS, NOT ENTRIES. The wrap-around arithmetic, the generation
+ * counter and the block copies are therefore untouched by the change — they were always counting
+ * slots. Only the places that read or write a pair step by `LOG_ENTRY_WORDS`, and `countSince`
+ * divides at the end because its callers ask for entries.
+ *
+ * What doubles is the record of what changed in a frame, never the component data: components keep
+ * their own fields and are not stored here.
  */
 export class Log {
-  /* layout: [index, generation, ...entries] */
+  /* layout: [index, generation, ...entries] — index counts WORDS */
   private data: Uint32Array;
-  /* layout: [length, generation, ...entries] */
+  /* layout: [length, generation, ...entries] — length counts WORDS */
   private corral: Uint32Array;
-  /* layout: [length, unused, ...entries] */
+  /* layout: [length, unused, ...entries] — length counts WORDS */
   private staging: Uint32Array;
   private typeCounters: Uint32Array;
+  /** Capacity in words; `maxEntries` is the capacity the caller asked for, in entries. */
+  private readonly maxWords: number;
 
   constructor(
     private readonly maxEntries: number, private readonly configParamName: string, buffers: Buffers,
@@ -41,12 +57,13 @@ export class Log {
       localProcessingAllowed: false, sortedByComponentType: false, numComponentTypes: 0
     }
   ) {
+    this.maxWords = maxEntries * LOG_ENTRY_WORDS;
     buffers.register(
-      `log.${configParamName}.buffer`, maxEntries + HEADER_LENGTH, Uint32Array,
+      `log.${configParamName}.buffer`, this.maxWords + HEADER_LENGTH, Uint32Array,
       (data: Uint32Array) => {this.data = data;}
     );
     buffers.register(
-      `log.${configParamName}.corral`, maxEntries + HEADER_LENGTH, Uint32Array,
+      `log.${configParamName}.corral`, this.maxWords + HEADER_LENGTH, Uint32Array,
       (corral: Uint32Array) => {this.corral = corral;}
     );
     if (options.sortedByComponentType) {
@@ -55,19 +72,30 @@ export class Log {
           `numComponentTypes required when ${this.configParamName} is sortedByComponentType`);
       }
       buffers.register(
-        `log.${configParamName}.staging`, maxEntries + HEADER_LENGTH, Uint32Array,
+        `log.${configParamName}.staging`, this.maxWords + HEADER_LENGTH, Uint32Array,
         (staging: Uint32Array) => {this.staging = staging;}
       );
       this.typeCounters = new Uint32Array(this.options.numComponentTypes!);
     }
   }
 
-  push(value: number, type?: ComponentType<any>): void {
+  /**
+   * Append one (entity, type) pair.
+   *
+   * The duplicate check compares against the pair written last. Upstream compared a single word at
+   * `corral[corralLength]`, which addressed a header slot rather than the last entry; with two
+   * words the last pair has to be addressed explicitly anyway, so it is now the pair that is
+   * compared.
+   */
+  push(entityId: number, typeId: number, type?: ComponentType<any>): void {
     const corralLength = this.corral[0];
-    CHECK: if (corralLength >= this.maxEntries) this.throwCapacityExceeded();
-    if (corralLength && this.corral[corralLength] === value) return;
-    this.corral[corralLength + HEADER_LENGTH] = value;
-    this.corral[0] += 1;
+    CHECK: if (corralLength + LOG_ENTRY_WORDS > this.maxWords) this.throwCapacityExceeded();
+    if (corralLength &&
+        this.corral[corralLength + HEADER_LENGTH - LOG_ENTRY_WORDS] === entityId &&
+        this.corral[corralLength + HEADER_LENGTH - LOG_ENTRY_WORDS + 1] === typeId) return;
+    this.corral[corralLength + HEADER_LENGTH] = entityId;
+    this.corral[corralLength + HEADER_LENGTH + 1] = typeId;
+    this.corral[0] += LOG_ENTRY_WORDS;
     DEBUG: if (!!type !== !!this.options.sortedByComponentType) {
       throw new InternalError(
         `Pushing value ${type ? 'with' : 'without'} type to log ${this.configParamName} ` +
@@ -96,6 +124,14 @@ export class Log {
     return true;
   }
 
+  /**
+   * Group the corral by component type, inserting a run header before each group of more than one.
+   *
+   * `typeCounters` counts ENTRIES per type, but every offset it carries afterwards is a WORD
+   * offset, because that is how the staging buffer is indexed. A run header occupies a full entry
+   * slot like any other: its first word holds the run length, its second the type id with the
+   * marker bit — the marker sits in the type word because the entity word has no spare bit left.
+   */
   private sortCorral(): Uint32Array {
     let offset = HEADER_LENGTH, soleTypeId = -1, soleTypeCount = 0, numNonZeroTypes = 0;
     for (let typeId = 0; typeId < this.typeCounters.length; typeId++) {
@@ -110,29 +146,41 @@ export class Log {
       }
       if (count === 1) {
         this.typeCounters[typeId] = offset;
-        offset += 1;
+        offset += LOG_ENTRY_WORDS;
       } else {
-        this.typeCounters[typeId] = offset + 1;
-        this.staging[offset] = count | (typeId << ENTITY_ID_BITS) | 2 ** 31;
-        offset += count + 1;
+        this.typeCounters[typeId] = offset + LOG_ENTRY_WORDS;
+        this.staging[offset] = count;
+        this.staging[offset + 1] = typeId | RUN_HEADER_FLAG;
+        offset += (count + 1) * LOG_ENTRY_WORDS;
       }
     }
     if (soleTypeId >= 0) {
       if (soleTypeCount > 1) {
-        CHECK: if (this.corral[0] === this.maxEntries) this.throwCapacityExceeded();
+        CHECK: {
+          if (this.corral[0] + LOG_ENTRY_WORDS > this.maxWords) this.throwCapacityExceeded();
+        }
         this.corral[this.corral[0] + HEADER_LENGTH] = this.corral[HEADER_LENGTH];
-        this.corral[HEADER_LENGTH] = this.corral[0] | (soleTypeId << ENTITY_ID_BITS) | 2 ** 31;
-        this.corral[0] += 1;
+        this.corral[this.corral[0] + HEADER_LENGTH + 1] = this.corral[HEADER_LENGTH + 1];
+        this.corral[HEADER_LENGTH] = this.corral[0] / LOG_ENTRY_WORDS;
+        this.corral[HEADER_LENGTH + 1] = soleTypeId | RUN_HEADER_FLAG;
+        this.corral[0] += LOG_ENTRY_WORDS;
       }
       this.typeCounters.fill(0);
       return this.corral;
     }
-    CHECK: if (this.corral[0] + numNonZeroTypes > this.maxEntries) this.throwCapacityExceeded();
+    CHECK: {
+      if (this.corral[0] + numNonZeroTypes * LOG_ENTRY_WORDS > this.maxWords) {
+        this.throwCapacityExceeded();
+      }
+    }
     const corralAndHeaderLength = this.corral[0] + HEADER_LENGTH;
-    for (let i = HEADER_LENGTH; i < corralAndHeaderLength; i++) {
-      const value = this.corral[i];
-      const typeId = value >>> ENTITY_ID_BITS;
-      this.staging[this.typeCounters[typeId]++] = value;
+    for (let i = HEADER_LENGTH; i < corralAndHeaderLength; i += LOG_ENTRY_WORDS) {
+      const entityId = this.corral[i];
+      const typeId = this.corral[i + 1];
+      const target = this.typeCounters[typeId];
+      this.staging[target] = entityId;
+      this.staging[target + 1] = typeId;
+      this.typeCounters[typeId] = target + LOG_ENTRY_WORDS;
     }
     this.staging[0] = offset - HEADER_LENGTH;
     this.typeCounters.fill(0);
@@ -142,7 +190,7 @@ export class Log {
   private copyToData(source: Uint32Array): void {
     let index = this.data[0];
     const length = source[0];
-    const firstSegmentLength = Math.min(length, this.maxEntries - index);
+    const firstSegmentLength = Math.min(length, this.maxWords - index);
     this.data.set(
       source.subarray(HEADER_LENGTH, firstSegmentLength + HEADER_LENGTH),
       index + HEADER_LENGTH
@@ -154,8 +202,8 @@ export class Log {
       );
     }
     index += length;
-    while (index >= this.maxEntries) {
-      index -= this.maxEntries;
+    while (index >= this.maxWords) {
+      index -= this.maxWords;
       this.data[1] += 1;
     }
     this.data[0] = index;
@@ -245,8 +293,9 @@ export class Log {
     startPointer.index = endIndex;
     startPointer.generation = endGeneration;
     if (startIndex === endIndex && startGeneration === endGeneration) return 0;
-    if (startIndex < endIndex) return endIndex - startIndex;
-    return this.maxEntries - (startIndex - endIndex);
+    /* The pointers walk WORDS; callers count ENTRIES, so the span is divided at the end. */
+    if (startIndex < endIndex) return (endIndex - startIndex) / LOG_ENTRY_WORDS;
+    return (this.maxWords - (startIndex - endIndex)) / LOG_ENTRY_WORDS;
   }
 
   private checkPointers(startPointer: LogPointer, endPointer?: LogPointer): void {
