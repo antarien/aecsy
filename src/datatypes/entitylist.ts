@@ -52,6 +52,12 @@ export class ArrayEntityList implements EntityList {
 }
 
 
+/**
+ * Maps entity ids to positions in a packed array. The lookup table stores `position + 1` so that
+ * the "not in list" marker is 0, which is what freshly allocated memory already holds: the table
+ * costs only address space until an entity actually lands in it. Encoding the marker as -1 would
+ * force a full pass over maxEntities entries per list before the world holds a single entity.
+ */
 export class PackedArrayEntityList implements EntityList {
   entities: Entity[] = [];
   private readonly lookupTable: Int32Array;
@@ -63,7 +69,6 @@ export class PackedArrayEntityList implements EntityList {
     maxEntities: number
   ) {
     this.lookupTable = new Int32Array(maxEntities);
-    this.lookupTable.fill(-1);
   }
 
   add(id: EntityId): void {
@@ -77,30 +82,34 @@ export class PackedArrayEntityList implements EntityList {
       }
     }
     const index = this.entities.push(entity) - 1;
-    this.lookupTable[id] = index;
+    this.lookupTable[id] = index + 1;
   }
 
   remove(id: EntityId): void {
-    const index = this.lookupTable[id];
+    const index = this.lookupTable[id] - 1;
     DEBUG: if (index < 0) throw new InternalError('Entity not in list');
     this.pool.return(id);
-    this.lookupTable[id] = -1;
+    this.lookupTable[id] = 0;
     const entity = this.entities.pop()!;
     if (index < this.entities.length) {
       this.entities[index] = entity;
-      this.lookupTable[entity.__id] = index;
+      this.lookupTable[entity.__id] = index + 1;
       if (this.orderBy) this.sorted = false;
     }
   }
 
   has(id: EntityId): boolean {
-    return this.lookupTable[id] >= 0;
+    return this.lookupTable[id] !== 0;
   }
 
   clear(): void {
-    for (const entity of this.entities) this.pool.return(entity.__id);
+    // Only the ids held in `entities` have a non-zero slot, so clearing costs the list's length
+    // rather than a pass over maxEntities.
+    for (const entity of this.entities) {
+      this.lookupTable[entity.__id] = 0;
+      this.pool.return(entity.__id);
+    }
     this.entities = [];
-    this.lookupTable.fill(-1);
     this.maxOrderKey = -Infinity;
     this.sorted = true;
   }
@@ -113,7 +122,7 @@ export class PackedArrayEntityList implements EntityList {
       return a.__sortKey < b.__sortKey ? -1 : a.__sortKey > b.__sortKey ? +1 : 0;
     });
     for (let i = 0; i < this.entities.length; i++) {
-      this.lookupTable[this.entities[i].__id] = i;
+      this.lookupTable[this.entities[i].__id] = i + 1;
     }
     this.sorted = true;
   }

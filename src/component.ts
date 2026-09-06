@@ -176,6 +176,15 @@ export function checkTypeDefined(type: ComponentType<any> | ComponentEnum): void
 }
 
 
+/**
+ * Maps entity ids to slots in the component's data arrays. The index stores `slot + 1` so that the
+ * "no slot" marker is 0, which freshly allocated memory already holds: the index costs only address
+ * space until an entity actually acquires a slot. Encoding the marker as -1 would force a full pass
+ * over maxEntities entries per component type before the world holds a single entity.
+ *
+ * The bias fits the element type chosen by `ArrayType`: a capacity of 127 yields slots 0..126 and
+ * hence stored values 1..127, the maximum an Int8Array holds; the Int16Array bound works the same.
+ */
 class PackedStorage implements Storage {
   declare index: Int8Array | Int16Array | Int32Array;
   // layout: bytesPerElement, nextIndex, capacity, numSpares, ...spareIndices
@@ -190,7 +199,7 @@ class PackedStorage implements Storage {
   }
 
   acquireIndex(id: number): number {
-    let index = this.index[id];
+    let index = this.index[id] - 1;
     if (index === -1) {
       if (this.spares[3] > 0) {
         index = this.spares[--this.spares[3] + 4];
@@ -211,19 +220,19 @@ class PackedStorage implements Storage {
         }
         index = this.spares[1]++;
       }
-      this.index[id] = index;
+      this.index[id] = index + 1;
     }
     return index;
   }
 
   releaseIndex(id: number): void {
-    DEBUG: if (this.index[id] === -1) {
+    DEBUG: if (this.index[id] === 0) {
       throw new InternalError(
         `Index for entity ${id} in component ${this.binding.type.name} not allocated`);
     }
     if (this.spares[3] === this.spares.length - 4) this.growSpares();
-    this.spares[this.spares[3]++ + 4] = this.index[id];
-    this.index[id] = -1;
+    this.spares[this.spares[3]++ + 4] = this.index[id] - 1;
+    this.index[id] = 0;
   }
 
   private growCapacity(): void {
@@ -234,7 +243,7 @@ class PackedStorage implements Storage {
     if (!this.index || elementSizeChanged) {
       this.binding.dispatcher.buffers.register(
         `component.${this.binding.type.id!}.storage.index`, this.maxEntities, ArrayType,
-        (index: any) => {this.index = index;}, -1
+        (index: any) => {this.index = index;}
       );
     }
     if (elementSizeChanged) {
@@ -448,9 +457,10 @@ export function defineAndAllocateComponentType<C extends Component>(type: Compon
       const storageManager =
         new PackedStorage(binding.dispatcher.maxEntities, binding, binding.fields);
       type.__bind = (id: EntityId, writable: boolean): C => {
+        // The index is biased by one, so an unallocated slot still reads as -1 here.
         return writable ?
-          binding.resetWritableInstance(id, storageManager.index[id]) :
-          binding.resetReadonlyInstance(id, storageManager.index[id]);
+          binding.resetWritableInstance(id, storageManager.index[id] - 1) :
+          binding.resetReadonlyInstance(id, storageManager.index[id] - 1);
       };
       type.__allocate = (id: EntityId): C => {
         return binding.resetWritableInstance(id, storageManager.acquireIndex(id));
