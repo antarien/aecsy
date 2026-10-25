@@ -76,6 +76,8 @@ export class Binding<C> {
   declare writableIndex: number;
   declare readonlyEntityId: EntityId;
   declare readonlyIndex: number;
+  declare changePending: boolean;
+  declare changeTrackingInstance: C | undefined;
   declare readonly initDefault: (component: any) => void;
   declare readonly init: (component: any, values: any) => void;
 
@@ -101,6 +103,8 @@ export class Binding<C> {
     this.writableIndex = 0;
     this.readonlyEntityId = 0 as EntityId;
     this.readonlyIndex = 0;
+    this.changePending = false;
+    this.changeTrackingInstance = undefined;
     // eslint-disable-next-line no-new-func
     this.initDefault = new Function(
       'component',
@@ -144,6 +148,39 @@ export class Binding<C> {
       this.writableInstance = Object.create(this.writableMaster as any);
     }
     return this.writableInstance;
+  }
+
+  /**
+   * The handle that `Entity.writeChanged` returns: it reads and writes through the current writable
+   * instance, and records the write for `changed` queries only on the first assignment that changes
+   * the stored value. The comparison reads the field back after the assignment, so it happens in
+   * the precision of the field's storage (a float32 field holds `Math.fround(v)`, an integer field
+   * the converted integer). One handle per binding, created on first use, so a call allocates
+   * nothing; like the writable instance it is invalidated by the next write of the same type.
+   */
+  get changeTrackingHandle(): C {
+    if (!this.changeTrackingInstance) {
+      this.changeTrackingInstance = new Proxy({} as any, {
+        get: (_target: any, prop: string | symbol): any => {
+          return (this.writableInstance as any)[prop];
+        },
+        set: (_target: any, prop: string | symbol, value: any): boolean => {
+          const instance = this.writableInstance as any;
+          if (!this.changePending) {
+            instance[prop] = value;
+            return true;
+          }
+          const before = instance[prop];
+          instance[prop] = value;
+          if (!Object.is(instance[prop], before)) {
+            this.changePending = false;
+            this.dispatcher.registry.trackWrite(this.writableEntityId, this.type);
+          }
+          return true;
+        }
+      }) as C;
+    }
+    return this.changeTrackingInstance;
   }
 
   resetReadonlyInstance(entityId: EntityId, index: number): C {

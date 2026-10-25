@@ -231,3 +231,65 @@ describe('changed type tracking', () => {
   });
 
 });
+
+
+@component class F {
+  @field.float32 declare value: number;
+}
+
+let changedValue = 0;
+let changedSeen = 0;
+
+class AssignF extends System {
+  entities = this.query(q => q.current.with(F).write);
+  execute() {
+    for (const entity of this.entities.current) entity.writeChanged(F).value = changedValue;
+  }
+}
+
+class WatchF extends System {
+  sked = this.schedule(s => s.after(AssignF));
+  entities = this.query(q => q.changed.with(F).read.trackWrites);
+  execute() {
+    changedSeen = this.entities.changed.length;
+  }
+}
+
+describe('change-only writes', () => {
+
+  async function settledWorld(): Promise<World> {
+    const world = await World.create({
+      maxEntities: 100, defaultComponentStorage: 'sparse', defs: [AssignF, WatchF]
+    });
+    changedValue = 0;
+    world.createEntity(F);
+    await world.execute();
+    await world.execute();
+    return world;
+  }
+
+  test('reports nothing when the same value is assigned', async () => {
+    const world = await settledWorld();
+    await world.execute();
+    expect(changedSeen).toBe(0);
+  });
+
+  test('reports a component whose value changes, once', async () => {
+    const world = await settledWorld();
+    changedValue = 2;
+    await world.execute();
+    expect(changedSeen).toBe(1);
+    await world.execute();
+    expect(changedSeen).toBe(0);
+  });
+
+  test('compares in the precision of the field storage', async () => {
+    const world = await settledWorld();
+    changedValue = 0.1;
+    await world.execute();
+    expect(changedSeen).toBe(1);
+    await world.execute();
+    expect(changedSeen).toBe(0);
+  });
+
+});

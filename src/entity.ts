@@ -267,6 +267,32 @@ export class EntityImpl {
   }
 
   /**
+   * Obtains a component of the entity that will allow writing to its fields, like {@link write},
+   * but marks the component as having been written to (for `changed` queries) only once an
+   * assignment actually changes a stored value.  A system that assigns the same values every frame
+   * thus leaves the component unchanged, and the `changed` queries of other systems do not see it.
+   *
+   * The comparison happens in the precision of the field's storage.  The same restrictions as for
+   * {@link write} apply: use the component immediately, and any subsequent request to write the
+   * same component type on any entity invalidates it.
+   * @param type The type of component to obtain.
+   * @returns The component of the given type that is part of the entity, ready for reading and
+   *  writing.
+   */
+  writeChanged<C>(type: ComponentType<C>): C {
+    CHECK: {
+      this.__checkValid();
+      this.__checkMask(type, 'write');
+      this.__checkHas(type, true);
+    }
+    const binding = type.__binding!;
+    const component = type.__bind!(this.__id, true);
+    if (!binding.trackedWrites) return component;
+    binding.changePending = true;
+    return binding.changeTrackingHandle;
+  }
+
+  /**
    * Deletes this entity and removes all its components.
    */
   delete(): void {
