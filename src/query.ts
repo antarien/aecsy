@@ -6,7 +6,7 @@ import {ArrayEntityList, type EntityList, PackedArrayEntityList} from './datatyp
 import {CheckError, InternalError} from './errors';
 import type {ComponentEnum} from './enums';
 
-type MaskKind = 'withMask' | 'withoutMask' | 'trackWritesMask';
+type MaskKind = 'withMask' | 'withoutMask' | 'trackWritesMask' | 'trackTypesMask';
 
 enum QueryFlavor {
   current = 1, added = 2, removed = 4, changed = 8, addedOrChanged = 16, changedOrRemoved = 32,
@@ -43,6 +43,10 @@ export class QueryBox {
   withoutMask: number[] | undefined;
   withoutEnumTypes: ComponentType<any>[];
   trackWritesMask: number[] | undefined;
+  trackTypesMask: number[] | undefined;
+  /* One bit per component type id, set when a tracked type changed since the previous execution. */
+  changedTypes: number[] | undefined;
+  anyTypeChanged = false;
   orderBy: (entity: Entity) => number;
   hasTransientResults: boolean;
   hasChangedResults: boolean;
@@ -55,6 +59,7 @@ export class QueryBox {
   constructor(query: Query, private readonly system: SystemBox) {
     query.__results = this.results;
     query.__systemName = system.name;
+    query.__box = this;
   }
 
   complete(): void {
@@ -85,7 +90,8 @@ export class QueryBox {
         }
       }
       const hasTrackers =
-        !!this.trackWritesMask || this.withAnyRecords?.some(item => item.lastMatches);
+        !!this.trackWritesMask || !!this.trackTypesMask ||
+        this.withAnyRecords?.some(item => item.lastMatches);
       if (this.hasChangedResults && !hasTrackers) {
         throw new CheckError(`Query for changed entities must track at least one component`);
       }
@@ -107,6 +113,7 @@ export class QueryBox {
       this.changedEntities = new Bitset(dispatcher.maxEntities);
       this.system.writeQueries.push(this);
     }
+    if (this.trackTypesMask) this.changedTypes = new Array(this.trackTypesMask.length).fill(0);
   }
 
   private allocateTransientResultLists(): void {
@@ -134,6 +141,17 @@ export class QueryBox {
     this.results.changedOrRemoved?.clear();
     this.results.addedChangedOrRemoved?.clear();
     this.changedEntities?.clear();
+    if (this.anyTypeChanged) {
+      this.changedTypes!.fill(0);
+      this.anyTypeChanged = false;
+    }
+  }
+
+  private markType(typeId: number): void {
+    const offset = typeId >> 5, mask = 1 << (typeId & 31);
+    if (!((this.trackTypesMask![offset] ?? 0) & mask)) return;
+    this.changedTypes![offset] |= mask;
+    this.anyTypeChanged = true;
   }
 
   clearAllResults(): void {
@@ -145,14 +163,23 @@ export class QueryBox {
     this.processedEntities.clear();
   }
 
-  handleShapeUpdate(id: EntityId): void {
-    if (this.processedEntities.get(id)) return;
+  handleShapeUpdate(id: EntityId, typeId?: number): void {
+    if (this.processedEntities.get(id)) {
+      /* The entity's match is settled for this pass: it matches now, or it was flagged because it
+         stopped matching. Either way the type touched an entity of this query. */
+      if (this.changedTypes && typeId !== undefined && (
+        (this.results.current?.has(id) ?? this.currentEntities!.get(id)) ||
+        this.changedEntities!.get(id)
+      )) this.markType(typeId);
+      return;
+    }
     this.processedEntities.set(id);
     const registry = this.system.dispatcher.registry;
     const oldMatch = this.results.current?.has(id) ?? this.currentEntities!.get(id);
     const newMatch = registry.matchShape(
       id, this.withMask, this.withValues, this.withAnyRecords, this.withoutMask,
       this.withoutEnumTypes);
+    if (this.changedTypes && typeId !== undefined && (oldMatch || newMatch)) this.markType(typeId);
     if (newMatch && !oldMatch) {
       this.currentEntities?.set(id);
       this.changedEntities?.set(id);
@@ -182,16 +209,23 @@ export class QueryBox {
   }
 
   handleWrite(id: EntityId, componentFlagOffset: number, componentFlagMask: number): void {
-    if (
-      !this.changedEntities!.get(id) &&
-      (this.hasShapeResults ?
-        (this.results.current?.has(id) ?? this.currentEntities!.get(id)) :
-        this.system.dispatcher.registry.matchShape(
-          id, this.withMask, this.withValues, this.withAnyRecords, this.withoutMask,
-          this.withoutEnumTypes)
-      ) &&
-      (this.trackWritesMask![componentFlagOffset] ?? 0) & componentFlagMask
-    ) {
+    if (!((this.trackWritesMask![componentFlagOffset] ?? 0) & componentFlagMask)) return;
+    const entityPending = !this.changedEntities!.get(id);
+    const typePending = !!this.changedTypes &&
+      !!((this.trackTypesMask![componentFlagOffset] ?? 0) & componentFlagMask) &&
+      !((this.changedTypes[componentFlagOffset] ?? 0) & componentFlagMask);
+    if (!entityPending && !typePending) return;
+    if (!(this.hasShapeResults ?
+      (this.results.current?.has(id) ?? this.currentEntities!.get(id)) :
+      this.system.dispatcher.registry.matchShape(
+        id, this.withMask, this.withValues, this.withAnyRecords, this.withoutMask,
+        this.withoutEnumTypes)
+    )) return;
+    if (typePending) {
+      this.changedTypes![componentFlagOffset] |= componentFlagMask;
+      this.anyTypeChanged = true;
+    }
+    if (entityPending) {
       this.changedEntities!.set(id);
       this.results.changed?.add(id);
       this.results.addedOrChanged?.add(id);
@@ -443,6 +477,21 @@ export class QueryBuilder {
   }
 
   /**
+   * Records, per component type, whether the most recently mentioned types changed since the last
+   * frame, readable with {@link Query.hasChangedType} and {@link Query.anyTypeChanged}.  A type
+   * counts as changed if a system called `write` on it for an entity matching the query (the type
+   * must also be tracked with `trackWrites`), or if a component of the type was added to or removed
+   * from an entity that matched the query before or after the change.
+   *
+   * One query with `withAny(...).trackWrites.trackTypes` over many types answers per type what a
+   * separate change query per type would, at the upkeep cost of a single query.
+   */
+  get trackTypes(): this {
+    this.set('trackTypesMask');
+    return this;
+  }
+
+  /**
    * Marks changes in the matching set of the immediately preceding `withAny` component types as
    * trackable for `changed` query flavors.  An entity will be considered changed if it matched the
    * query in the last frame and still matches it in the current frame, but satisfied the `withAny`
@@ -581,8 +630,37 @@ export class QueryBuilder {
 export class Query {
   __results: Partial<Record<QueryFlavorName, EntityList>> & {current?: PackedArrayEntityList};
   __systemName: string;
+  __box: QueryBox;
 
   // TODO: add an API for freezing/thawing a query
+
+  /**
+   * Whether a component of the given type changed between the system's current (or last) and
+   * previous executions, as defined by {@link QueryBuilder.trackTypes}.
+   * @param type A component type the query tracks with `trackTypes`.
+   */
+  hasChangedType(type: ComponentType<any>): boolean {
+    CHECK: this.__checkTypes();
+    const id = type.id!;
+    return Boolean((this.__box.changedTypes![id >> 5] ?? 0) & (1 << (id & 31)));
+  }
+
+  /**
+   * Whether any of the types tracked with {@link QueryBuilder.trackTypes} changed between the
+   * system's current (or last) and previous executions.
+   */
+  get anyTypeChanged(): boolean {
+    CHECK: this.__checkTypes();
+    return this.__box.anyTypeChanged;
+  }
+
+  private __checkTypes(): void {
+    if (!this.__box.changedTypes) {
+      throw new CheckError(
+        `Query types not tracked, please add .trackTypes to your query definition in ` +
+        `system ${this.__systemName}`);
+    }
+  }
 
   /**
    * A list of all entities that match this query as of the beginning of the system's current (or

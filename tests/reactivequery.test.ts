@@ -149,3 +149,85 @@ describe('changed queries', () => {
   });
 
 });
+
+
+let typeStep: 'none' | 'writeA' | 'addB' | 'removeB' = 'none';
+let typeSeen: {a: boolean, b: boolean, any: boolean} = {a: false, b: false, any: false};
+
+class StepTypes extends System {
+  entities = this.query(q => q.current.with(A).write.and.using(B).write);
+  execute() {
+    for (const entity of this.entities.current) {
+      if (typeStep === 'writeA') entity.write(A).value += 1;
+      if (typeStep === 'addB' && !entity.has(B)) entity.add(B);
+      if (typeStep === 'removeB' && entity.has(B)) entity.remove(B);
+    }
+  }
+}
+
+class WatchTypes extends System {
+  sked = this.schedule(s => s.after(StepTypes));
+  entities = this.query(q => q.changed.withAny(A, B).read.trackWrites.trackTypes);
+  execute() {
+    typeSeen = {
+      a: this.entities.hasChangedType(A), b: this.entities.hasChangedType(B),
+      any: this.entities.anyTypeChanged
+    };
+  }
+}
+
+class WatchWithoutTypes extends System {
+  entities = this.query(q => q.changed.with(A).read.trackWrites);
+  execute() {
+    this.entities.hasChangedType(A);
+  }
+}
+
+describe('changed type tracking', () => {
+
+  test('reports the types of entities created before the first frame, then nothing', async () => {
+    const world = await createWorld(StepTypes, WatchTypes);
+    typeStep = 'none';
+    world.createEntity(A);
+    world.createEntity(B);
+    await world.execute();
+    expect(typeSeen).toEqual({a: true, b: true, any: true});
+    await world.execute();
+    expect(typeSeen).toEqual({a: false, b: false, any: false});
+  });
+
+  test('reports a written type and only that type', async () => {
+    const world = await createWorld(StepTypes, WatchTypes);
+    typeStep = 'none';
+    world.createEntity(A, B);
+    await world.execute();
+    await world.execute();
+    typeStep = 'writeA';
+    await world.execute();
+    expect(typeSeen).toEqual({a: true, b: false, any: true});
+    typeStep = 'none';
+    await world.execute();
+    expect(typeSeen).toEqual({a: false, b: false, any: false});
+  });
+
+  test('reports a type added to or removed from an entity that keeps matching', async () => {
+    const world = await createWorld(StepTypes, WatchTypes);
+    typeStep = 'none';
+    world.createEntity(A);
+    await world.execute();
+    await world.execute();
+    typeStep = 'addB';
+    await world.execute();
+    expect(typeSeen).toEqual({a: false, b: true, any: true});
+    typeStep = 'removeB';
+    await world.execute();
+    expect(typeSeen).toEqual({a: false, b: true, any: true});
+  });
+
+  test('refuses to answer for a query without trackTypes', async () => {
+    const world = await createWorld(WatchWithoutTypes);
+    world.createEntity(A);
+    await expect(world.execute()).rejects.toThrow('Query types not tracked');
+  });
+
+});

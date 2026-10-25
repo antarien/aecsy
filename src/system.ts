@@ -500,7 +500,7 @@ export class SystemBox {
       return;
     }
     for (const query of this.shapeQueries) query.clearProcessedEntities();
-    let queries: QueryBox[] | undefined, runLength = 0;
+    let queries: QueryBox[] | undefined, runLength = 0, runTypeId = 0;
     let log: Uint32Array | undefined, startIndex: number | undefined, endIndex: number | undefined;
     while (true) {
       [log, startIndex, endIndex] = shapeLog.processSince(this.shapeLogPointer);
@@ -518,6 +518,7 @@ export class SystemBox {
              numbers rather than through `&`, which would coerce them to signed 32-bit. */
           const runHeader = typeWord >= RUN_HEADER_FLAG;
           const typeId = typeWord % RUN_HEADER_FLAG;
+          runTypeId = typeId;
           queries = this.shapeQueriesByComponent[typeId];
           if (runHeader) {
             runLength = entityId;
@@ -534,7 +535,9 @@ export class SystemBox {
         DEBUG: if (typeWord >= RUN_HEADER_FLAG) {
           throw new InternalError('Trying to process run header as entry in shape log');
         }
-        for (let j = 0; j < queries.length; j++) queries[j].handleShapeUpdate(entityId);
+        for (let j = 0; j < queries.length; j++) {
+          queries[j].handleShapeUpdate(entityId, runTypeId);
+        }
         if (--runLength === 0) queries = undefined;
       }
     }
