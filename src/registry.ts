@@ -14,7 +14,7 @@ import {LOG_ENTRY_WORDS} from './consts';
 import type {SystemBox} from './system';
 import {AtomicSharedShapeArray, type ShapeArray, UnsharedShapeArray} from './datatypes/shapearray';
 import {CheckError, InternalError} from './errors';
-import type {TrackingMask} from './query';
+import type {CompactMask, TrackingMask} from './query';
 
 
 const SYSTEM_ERROR_TYPES = [
@@ -109,8 +109,9 @@ export class Registry {
       'registry.shapes', this.numShapeBits, maxEntities, dispatcher.buffers);
     this.staleShapes = new ShapeArrayClass(
       'registry.staleShapes', this.numShapeBits, maxEntities, dispatcher.buffers);
+    // Cleared after every removal pass; it lists its writes, so a clear costs what the pass wrote.
     this.removedShapes = new ShapeArrayClass(
-      'registry.removedShapes', this.numShapeBits, maxEntities, dispatcher.buffers);
+      'registry.removedShapes', this.numShapeBits, maxEntities, dispatcher.buffers, true);
     this.entityIdPool = dispatcher.threaded ?
       new SharedAtomicPool(maxEntities, 'maxEntities', dispatcher.buffers) :
       new UnsharedPool(maxEntities, 'maxEntities');
@@ -405,6 +406,7 @@ export class Registry {
     this.staleShapes.set(id, type);
     CHECK: this.reshapedEntityIds.push(id);
     if (type !== this.Alive || this.hasNegativeQueries) {
+      this.dispatcher.wake(type.id!);
       this.dispatcher.shapeLog.push(id, type.id!, type);
     }
   }
@@ -416,12 +418,14 @@ export class Registry {
     CHECK: this.reshapedEntityIds.push(id);
     this.removalLog.push(id, type.id!);
     if (type !== this.Alive || this.hasNegativeQueries) {
+      this.dispatcher.wake(type.id!);
       this.dispatcher.shapeLog.push(id, type.id!, type);
     }
     STATS: this.dispatcher.stats.forComponent(type).numEntities -= 1;
   }
 
   trackWrite(id: EntityId, type: ComponentType<any>): void {
+    this.dispatcher.wake(type.id!);
     this.dispatcher.writeLog!.push(id, type.id!, type);
   }
 
@@ -434,13 +438,11 @@ export class Registry {
   }
 
   matchShape(
-    id: EntityId, positiveMask?: number[], positiveValues?: number[],
-    trackingMasks?: TrackingMask[], negativeMask?: number[], negativeTypes?: ComponentType<any>[]
+    id: EntityId, positive?: CompactMask, trackingMasks?: TrackingMask[],
+    negative?: CompactMask, negativeTypes?: ComponentType<any>[]
   ): boolean {
-    if (positiveMask && positiveValues && !this.shapes.match(id, positiveMask, positiveValues)) {
-      return false;
-    }
-    if (negativeMask && !this.shapes.matchNot(id, negativeMask)) return false;
+    if (positive && !this.shapes.match(id, positive)) return false;
+    if (negative && !this.shapes.matchNot(id, negative)) return false;
     if (negativeTypes) {
       for (const type of negativeTypes) if (this.shapes.isSet(id, type)) return false;
     }
@@ -448,7 +450,7 @@ export class Registry {
       for (const trackingMask of trackingMasks) {
         if (trackingMask.lastMatches) {
           if (!this.shapes.matchAny(id, trackingMask)) return false;
-        } else if (this.shapes.matchNot(id, trackingMask.mask)) {
+        } else if (this.shapes.matchNot(id, trackingMask.match!)) {
           return false;
         }
       }

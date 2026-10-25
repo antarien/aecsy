@@ -1,5 +1,6 @@
 import type {Component, ComponentType} from './component';
 import {Graph} from './datatypes/graph';
+import {MinHeap} from './datatypes/minheap';
 import type {Dispatcher} from './dispatcher';
 import type {SystemGroup} from './schedule';
 import type {SystemBox} from './system';
@@ -17,12 +18,30 @@ export abstract class Plan {
 }
 
 
-class SimplePlan extends Plan {
+export class SimplePlan extends Plan {
   private readonly systems: SystemBox[];
+  /* The positions of the systems that run in every frame, in order, and of the systems that run
+     only on changes and were woken. A frame visits these two and nothing else, so a sleeping system
+     costs nothing however many there are. */
+  private readonly everyFrame: number[] = [];
+  private readonly woken = new MinHeap();
+  private readonly wokenForNextFrame: number[] = [];
+  private readonly queued: Uint8Array;
+  private position = -1;
 
   constructor(protected readonly planner: Planner, protected readonly group: SystemGroup) {
     super(planner, group);
     this.systems = this.graph.topologicallySortedVertices;
+    this.queued = new Uint8Array(this.systems.length);
+    for (let position = 0; position < this.systems.length; position++) {
+      const system = this.systems[position];
+      if (system.onlyOnChanges) {
+        system.planWakes.push(this, position);
+        if (system.woken) this.wakeAt(position);
+      } else {
+        this.everyFrame.push(position);
+      }
+    }
     CHECK: if (this.systems.length > 1 && (
       typeof process === 'undefined' || process.env.NODE_ENV === 'development'
     )) {
@@ -31,15 +50,42 @@ class SimplePlan extends Plan {
     }
   }
 
+  /**
+   * Queues a system that runs only on changes. One woken by a system before it in this frame runs
+   * in this frame, one woken by itself or a system after it runs in the next: the frame order a
+   * full scan of every system gives.
+   */
+  wakeAt(position: number): void {
+    if (this.queued[position]) return;
+    this.queued[position] = 1;
+    if (position > this.position) {
+      this.woken.push(position);
+    } else {
+      this.wokenForNextFrame.push(position);
+    }
+  }
+
   execute(time: number, delta: number): Promise<void> {
     const dispatcher = this.planner.dispatcher;
     const systems = this.systems;
+    const everyFrame = this.everyFrame;
+    const woken = this.woken;
     this.group.__executed = true;
-    for (let i = 0; i < systems.length; i++) {
-      const system = systems[i];
-      system.execute(time, delta);
-      dispatcher.flush();
+    let next = 0;
+    while (next < everyFrame.length || woken.size) {
+      let position: number;
+      if (woken.size && (next === everyFrame.length || woken.peek() < everyFrame[next])) {
+        position = woken.pop();
+        this.queued[position] = 0;
+      } else {
+        position = everyFrame[next++];
+      }
+      this.position = position;
+      if (systems[position].execute(time, delta)) dispatcher.flush();
     }
+    this.position = -1;
+    for (const position of this.wokenForNextFrame) woken.push(position);
+    this.wokenForNextFrame.length = 0;
     return Promise.resolve();
   }
 

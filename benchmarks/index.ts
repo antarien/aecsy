@@ -8,6 +8,7 @@ const BENCHMARKS = [
   'ecs-benchmark',
   'ecs-packed',
   'ecs-packed-elastic',
+  'system-cost',
   // TODO: create benchmarks for refs, backrefs
 ];
 

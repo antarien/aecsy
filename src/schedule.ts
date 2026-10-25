@@ -93,6 +93,18 @@ export class ScheduleBuilder {
     return this;
   }
 
+  /**
+   * Executes this system only in a frame after a component type its queries look at was written,
+   * added or removed somewhere, or while one of its coroutines runs.  In every other frame the
+   * system is not called at all, so a system whose queries see nothing costs one flag check.  Its
+   * `execute` must therefore do nothing a frame without changes would need.
+   * @returns The builder for chaining calls.
+   */
+  get onlyOnChanges(): this {
+    for (const system of this.__systems) system.onlyOnChanges = true;
+    return this;
+  }
+
   private __checkNoLaneAssigned(): void {
     if (this.__systems.some(system => system.lane)) {
       throw new CheckError(`Threading semantics already specified`);

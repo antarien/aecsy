@@ -1,26 +1,29 @@
 import {InternalError} from '../errors';
 
+/* A page holds 1024 words, 32768 bits: an entity range that a query touching it at all will likely
+   touch again, and a size one fill zeroes in a few hundred nanoseconds. */
+const PAGE_SHIFT = 15;
+const PAGE_WORDS = 1024;
+const WORD_IN_PAGE = PAGE_WORDS - 1;
+
 /**
- * A fixed but arbitrary size bitset.
+ * A fixed but arbitrary size bitset that allocates its storage page by page.
  *
- * Clearing costs time in proportion to the words written since the last clear, not to the size.
- * Queries hold bitsets over `maxEntities` and clear them every frame they process a shape or
- * write log; a full fill there costs the whole field per query per frame even when a handful of
- * entities changed. Every word that receives a bit is listed once, and `clear` zeroes only the
- * listed words.
+ * Queries hold bitsets over `maxEntities`, and a world can hold thousands of queries that each see
+ * a handful of entities. A page is allocated when its first bit is set, so a bitset costs its page
+ * directory plus the pages it touched, never the whole field. Clearing zeroes only the pages
+ * touched since the last clear.
  */
 export class Bitset {
-  private readonly bytes: Uint32Array;
-  /* One bit per word of `bytes`: set while that word stands in `touchedWords`. */
-  private readonly listedWords: Uint32Array;
-  private touchedWords: Uint32Array;
-  private touchedCount = 0;
+  private readonly pages: (Uint32Array | undefined)[];
+  /* The indices of the pages written since the last clear, each listed once. */
+  private readonly touchedPages: number[] = [];
+  private readonly pageTouched: Uint8Array;
 
   constructor(private readonly size: number) {
-    const words = Math.ceil(size / 32);
-    this.bytes = new Uint32Array(words);
-    this.listedWords = new Uint32Array(Math.ceil(words / 32));
-    this.touchedWords = new Uint32Array(Math.min(words, 16));
+    const pageCount = Math.ceil(size / (PAGE_WORDS * 32));
+    this.pages = new Array(pageCount);
+    this.pageTouched = new Uint8Array(pageCount);
   }
 
   get(index: number): boolean {
@@ -29,7 +32,9 @@ export class Bitset {
         throw new InternalError(`Bit index out of bounds: ${index}`);
       }
     }
-    return (this.bytes[index >>> 5] & (1 << (index & 31))) !== 0;
+    const page = this.pages[index >>> PAGE_SHIFT];
+    if (!page) return false;
+    return (page[(index >>> 5) & WORD_IN_PAGE] & (1 << (index & 31))) !== 0;
   }
 
   set(index: number): void {
@@ -38,14 +43,14 @@ export class Bitset {
         throw new InternalError(`Bit index out of bounds: ${index}`);
       }
     }
-    const word = index >>> 5;
-    const listedBit = 1 << (word & 31);
-    if ((this.listedWords[word >>> 5] & listedBit) === 0) {
-      this.listedWords[word >>> 5] |= listedBit;
-      if (this.touchedCount === this.touchedWords.length) this.growTouchedWords();
-      this.touchedWords[this.touchedCount++] = word;
+    const pageIndex = index >>> PAGE_SHIFT;
+    let page = this.pages[pageIndex];
+    if (!page) page = this.pages[pageIndex] = new Uint32Array(PAGE_WORDS);
+    if (!this.pageTouched[pageIndex]) {
+      this.pageTouched[pageIndex] = 1;
+      this.touchedPages.push(pageIndex);
     }
-    this.bytes[word] |= (1 << (index & 31));
+    page[(index >>> 5) & WORD_IN_PAGE] |= (1 << (index & 31));
   }
 
   unset(index: number): void {
@@ -54,28 +59,17 @@ export class Bitset {
         throw new InternalError(`Bit index out of bounds: ${index}`);
       }
     }
-    this.bytes[index >>> 5] &= ~(1 << (index & 31));
+    const page = this.pages[index >>> PAGE_SHIFT];
+    if (page) page[(index >>> 5) & WORD_IN_PAGE] &= ~(1 << (index & 31));
   }
 
   clear(): void {
-    /* Past an eighth of the words the scattered writes cost more than one contiguous fill. */
-    if (this.touchedCount > (this.bytes.length >>> 3)) {
-      this.bytes.fill(0);
-      this.listedWords.fill(0);
-    } else {
-      for (let i = 0; i < this.touchedCount; i++) {
-        const word = this.touchedWords[i];
-        this.bytes[word] = 0;
-        this.listedWords[word >>> 5] = 0;
-      }
+    const touchedPages = this.touchedPages;
+    for (let i = 0; i < touchedPages.length; i++) {
+      const pageIndex = touchedPages[i];
+      this.pages[pageIndex]!.fill(0);
+      this.pageTouched[pageIndex] = 0;
     }
-    this.touchedCount = 0;
-  }
-
-  private growTouchedWords(): void {
-    /* A word is listed at most once between clears, so the list never outgrows `bytes`. */
-    const grown = new Uint32Array(Math.min(this.bytes.length, this.touchedWords.length * 2));
-    grown.set(this.touchedWords);
-    this.touchedWords = grown;
+    touchedPages.length = 0;
   }
 }

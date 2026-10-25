@@ -48,6 +48,13 @@ export class Log {
   /* layout: [length, unused, ...entries] — length counts WORDS */
   private staging: Uint32Array;
   private typeCounters: Uint32Array;
+  /**
+   * How many entries were pushed since the log was made, and per component type the count at its
+   * last push. A reader that remembers the count it saw can ask whether any of ITS types was pushed
+   * since, in one look per type, instead of walking every entry of every type to find out.
+   */
+  private pushes = 0;
+  private lastPushByType: Float64Array;
   /** Capacity in words; `maxEntries` is the capacity the caller asked for, in entries. */
   private readonly maxWords: number;
 
@@ -76,6 +83,7 @@ export class Log {
         (staging: Uint32Array) => {this.staging = staging;}
       );
       this.typeCounters = new Uint32Array(this.options.numComponentTypes!);
+      this.lastPushByType = new Float64Array(this.options.numComponentTypes!);
     }
   }
 
@@ -101,7 +109,27 @@ export class Log {
         `Pushing value ${type ? 'with' : 'without'} type to log ${this.configParamName} ` +
         `${this.options.sortedByComponentType ? '' : 'not '}sorted by component type`);
     }
-    if (type) this.typeCounters[type.id!] += 1;
+    this.pushes += 1;
+    if (type) {
+      this.typeCounters[type.id!] += 1;
+      this.lastPushByType[type.id!] = this.pushes;
+    }
+  }
+
+  /** The number of entries pushed since the log was made; a reader keeps it for `hasPushesOf`. */
+  get pushCount(): number {
+    return this.pushes;
+  }
+
+  /**
+   * Whether an entry of any of the given component types was pushed after the reader saw
+   * `seenCount`. Only a log sorted by component type keeps the count per type.
+   */
+  hasPushesOf(typeIds: readonly number[], seenCount: number): boolean {
+    for (let i = 0; i < typeIds.length; i++) {
+      if (this.lastPushByType[typeIds[i]] > seenCount) return true;
+    }
+    return false;
   }
 
   commit(pointer?: LogPointer): boolean {

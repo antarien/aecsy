@@ -31,6 +31,30 @@ export interface TrackingMask {
   mask: number[];  // the withAny mask itself
   lastMatches: number[][] | undefined;  // don't track matches if undefined
   changed: boolean;  // side-channel to return value from matchAny; overwritten for each entity
+  match?: CompactMask;  // the non-zero words of `mask`, what matching reads
+}
+
+/**
+ * The non-zero words of a shape mask: their offsets, the mask bits and, for a positive mask, the
+ * values the masked bits must hold. Matching walks these instead of the full mask, whose length
+ * follows the highest component type id it names rather than the number of types it names.
+ */
+export interface CompactMask {
+  offsets: number[];
+  masks: number[];
+  values: number[];
+}
+
+function compactMask(mask: number[], values?: number[]): CompactMask {
+  const compact: CompactMask = {offsets: [], masks: [], values: []};
+  for (let offset = 0; offset < mask.length; offset++) {
+    const word = mask[offset] ?? 0;
+    if (!word) continue;
+    compact.offsets.push(offset);
+    compact.masks.push(word);
+    compact.values.push(values?.[offset] ?? 0);
+  }
+  return compact;
 }
 
 
@@ -41,6 +65,8 @@ export class QueryBox {
   withValues: number[] | undefined;
   withAnyRecords: TrackingMask[] | undefined;
   withoutMask: number[] | undefined;
+  withMatch: CompactMask | undefined;
+  withoutMatch: CompactMask | undefined;
   withoutEnumTypes: ComponentType<any>[];
   trackWritesMask: number[] | undefined;
   trackTypesMask: number[] | undefined;
@@ -114,6 +140,11 @@ export class QueryBox {
       this.system.writeQueries.push(this);
     }
     if (this.trackTypesMask) this.changedTypes = new Array(this.trackTypesMask.length).fill(0);
+    if (this.withMask) this.withMatch = compactMask(this.withMask, this.withValues);
+    if (this.withoutMask) this.withoutMatch = compactMask(this.withoutMask);
+    if (this.withAnyRecords) {
+      for (const record of this.withAnyRecords) record.match = compactMask(record.mask);
+    }
   }
 
   private allocateTransientResultLists(): void {
@@ -177,8 +208,7 @@ export class QueryBox {
     const registry = this.system.dispatcher.registry;
     const oldMatch = this.results.current?.has(id) ?? this.currentEntities!.get(id);
     const newMatch = registry.matchShape(
-      id, this.withMask, this.withValues, this.withAnyRecords, this.withoutMask,
-      this.withoutEnumTypes);
+      id, this.withMatch, this.withAnyRecords, this.withoutMatch, this.withoutEnumTypes);
     if (this.changedTypes && typeId !== undefined && (oldMatch || newMatch)) this.markType(typeId);
     if (newMatch && !oldMatch) {
       this.currentEntities?.set(id);
@@ -218,8 +248,7 @@ export class QueryBox {
     if (!(this.hasShapeResults ?
       (this.results.current?.has(id) ?? this.currentEntities!.get(id)) :
       this.system.dispatcher.registry.matchShape(
-        id, this.withMask, this.withValues, this.withAnyRecords, this.withoutMask,
-        this.withoutEnumTypes)
+        id, this.withMatch, this.withAnyRecords, this.withoutMatch, this.withoutEnumTypes)
     )) return;
     if (typePending) {
       this.changedTypes![componentFlagOffset] |= componentFlagMask;
@@ -607,21 +636,37 @@ export class QueryBuilder {
       if (readMask) extendMaskAndSetFlag(this.__system.accessMasks.check!, type);
       if (typeof type === 'function') {
         if (map) map.get(type)!.add(this.__system);
-        if (shapeMask) this.categorize(this.__system.shapeQueriesByComponent, type);
-        if (trackMask) this.categorize(this.__system.writeQueriesByComponent, type);
+        if (shapeMask) {
+          this.categorize(
+            this.__system.shapeQueriesByComponent, this.__system.shapeTypeIds, type);
+        }
+        if (trackMask) {
+          this.categorize(
+            this.__system.writeQueriesByComponent, this.__system.writeTypeIds, type);
+        }
       } else {
         for (const enumType of type.__types) {
           if (map) map.get(enumType)!.add(this.__system);
-          if (shapeMask) this.categorize(this.__system.shapeQueriesByComponent, enumType);
-          if (trackMask) this.categorize(this.__system.writeQueriesByComponent, enumType);
+          if (shapeMask) {
+            this.categorize(
+              this.__system.shapeQueriesByComponent, this.__system.shapeTypeIds, enumType);
+          }
+          if (trackMask) {
+            this.categorize(
+              this.__system.writeQueriesByComponent, this.__system.writeTypeIds, enumType);
+          }
         }
       }
     }
   }
 
-  private categorize(index: QueryBox[][], type: ComponentType<any>): void {
+  /** Files the query under its type, and the type id once in the system's list of its types. */
+  private categorize(index: QueryBox[][], typeIds: number[], type: ComponentType<any>): void {
     const id = type.id!;
-    if (!index[id]) index[id] = [];
+    if (!index[id]) {
+      index[id] = [];
+      typeIds.push(id);
+    }
     if (!index[id].includes(this.__query)) index[id].push(this.__query);
   }
 }

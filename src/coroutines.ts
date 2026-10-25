@@ -364,12 +364,21 @@ export class Supervisor {
   private readonly coroutines: CoroutineImpl<any>[] = [];
   private readonly mutuallyExclusiveCoroutines = new Map<string, Coroutine[]>();
 
+  /** Told when a coroutine starts, so a system that runs only on changes gets its next frame. */
+  onStart?: () => void;
+
   constructor(readonly system: System) {}
+
+  /** Whether no coroutine of the system is running. */
+  get idle(): boolean {
+    return !this.coroutines.length;
+  }
 
   start<CoFn extends CoroutineFunction>(coroutineFn: CoFn, ...args: Parameters<CoFn>): Coroutine {
     const coroutine =
       new CoroutineImpl(coroutineFn.apply(this.system, args), coroutineFn, this);
     this.coroutines.push(coroutine);
+    this.onStart?.();
     return coroutine;
   }
 

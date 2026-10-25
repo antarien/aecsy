@@ -52,15 +52,24 @@ export class ArrayEntityList implements EntityList {
 }
 
 
+/* A lookup page covers 4096 entity ids, 16 KB: one fill-free allocation the first time a list holds
+   an entity in that range. */
+const LOOKUP_PAGE_SHIFT = 12;
+const LOOKUP_PAGE_SIZE = 1 << LOOKUP_PAGE_SHIFT;
+const LOOKUP_IN_PAGE = LOOKUP_PAGE_SIZE - 1;
+
 /**
  * Maps entity ids to positions in a packed array. The lookup table stores `position + 1` so that
- * the "not in list" marker is 0, which is what freshly allocated memory already holds: the table
- * costs only address space until an entity actually lands in it. Encoding the marker as -1 would
- * force a full pass over maxEntities entries per list before the world holds a single entity.
+ * the "not in list" marker is 0, which is what freshly allocated memory already holds.
+ *
+ * A world holds one such list per `current` query, and a query sees a few entities out of
+ * `maxEntities`. The table is therefore split into pages that are allocated when the first entity
+ * of their id range enters the list: a list costs its page directory plus the pages it touched,
+ * never an array over every entity id.
  */
 export class PackedArrayEntityList implements EntityList {
   entities: Entity[] = [];
-  private readonly lookupTable: Int32Array;
+  private readonly lookupPages: (Int32Array | undefined)[];
   private maxOrderKey = -Infinity;
   private sorted = true;
 
@@ -68,7 +77,22 @@ export class PackedArrayEntityList implements EntityList {
     private readonly pool: EntityPool, private readonly orderBy: OrderTransform | undefined,
     maxEntities: number
   ) {
-    this.lookupTable = new Int32Array(maxEntities);
+    this.lookupPages = new Array(Math.ceil(maxEntities / LOOKUP_PAGE_SIZE));
+  }
+
+  private lookup(id: EntityId): number {
+    const page = this.lookupPages[id >>> LOOKUP_PAGE_SHIFT];
+    return page ? page[id & LOOKUP_IN_PAGE] : 0;
+  }
+
+  private store(id: EntityId, slot: number): void {
+    const pageIndex = id >>> LOOKUP_PAGE_SHIFT;
+    let page = this.lookupPages[pageIndex];
+    if (!page) {
+      if (slot === 0) return;
+      page = this.lookupPages[pageIndex] = new Int32Array(LOOKUP_PAGE_SIZE);
+    }
+    page[id & LOOKUP_IN_PAGE] = slot;
   }
 
   add(id: EntityId): void {
@@ -82,31 +106,31 @@ export class PackedArrayEntityList implements EntityList {
       }
     }
     const index = this.entities.push(entity) - 1;
-    this.lookupTable[id] = index + 1;
+    this.store(id, index + 1);
   }
 
   remove(id: EntityId): void {
-    const index = this.lookupTable[id] - 1;
+    const index = this.lookup(id) - 1;
     DEBUG: if (index < 0) throw new InternalError('Entity not in list');
     this.pool.return(id);
-    this.lookupTable[id] = 0;
+    this.store(id, 0);
     const entity = this.entities.pop()!;
     if (index < this.entities.length) {
       this.entities[index] = entity;
-      this.lookupTable[entity.__id] = index + 1;
+      this.store(entity.__id, index + 1);
       if (this.orderBy) this.sorted = false;
     }
   }
 
   has(id: EntityId): boolean {
-    return this.lookupTable[id] !== 0;
+    return this.lookup(id) !== 0;
   }
 
   clear(): void {
     // Only the ids held in `entities` have a non-zero slot, so clearing costs the list's length
     // rather than a pass over maxEntities.
     for (const entity of this.entities) {
-      this.lookupTable[entity.__id] = 0;
+      this.store(entity.__id, 0);
       this.pool.return(entity.__id);
     }
     this.entities = [];
@@ -121,9 +145,7 @@ export class PackedArrayEntityList implements EntityList {
     this.entities.sort((a, b) => {
       return a.__sortKey < b.__sortKey ? -1 : a.__sortKey > b.__sortKey ? +1 : 0;
     });
-    for (let i = 0; i < this.entities.length; i++) {
-      this.lookupTable[this.entities[i].__id] = i + 1;
-    }
+    for (let i = 0; i < this.entities.length; i++) this.store(this.entities[i].__id, i + 1);
     this.sorted = true;
   }
 }

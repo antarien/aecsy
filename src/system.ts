@@ -8,7 +8,7 @@ import {type ComponentType, declareSingleton} from './component';
 import {
   type GroupContentsArray, now, Schedule, ScheduleBuilder, type SystemGroup, SystemGroupImpl
 } from './schedule';
-import type {Lane} from './planner';
+import type {Lane, SimplePlan} from './planner';
 import type {SystemStats} from './stats';
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 import {co, type Coroutine, type CoroutineFunction, Supervisor} from './coroutines';
@@ -338,6 +338,13 @@ export class SystemBox {
   declare private ranQueriesLastFrame: boolean;
   declare private shapeLogPointer: LogPointer;
   declare private writeLogPointer?: LogPointer;
+  /* The component types this system's shape and write queries look at, and the push count of
+     each log when the system last ran: entries of other types are skipped by the update loops
+     anyway, so a log that only grew by such entries leaves this system's queries as they are. */
+  declare readonly shapeTypeIds: number[];
+  declare readonly writeTypeIds: number[];
+  declare private shapePushesSeen: number;
+  declare private writePushesSeen: number;
   declare private state: RunState;
   declare readonly stats: SystemStats;
   declare readonly attachedSystems: (SystemBox | undefined)[];
@@ -347,6 +354,13 @@ export class SystemBox {
   declare lane?: Lane;
   declare stateless: boolean;
   declare weight: number;
+  /* Set by `onlyOnChanges` in the schedule: the system runs only in a frame after an entry of one
+     of its query types reached a log, and `woken` says whether that happened since its last run. */
+  declare onlyOnChanges: boolean;
+  declare woken: boolean;
+  declare private readonly supervisor: Supervisor;
+  /** Pairs of a plan and this system's position in it, told when the system wakes. */
+  declare readonly planWakes: (SimplePlan | number)[];
 
   get id(): number {return this.system.id;}
   get name(): string {return this.system.name;}
@@ -363,7 +377,19 @@ export class SystemBox {
     this.propsAssigned = false;
     this.stateless = false;
     this.weight = 1;
+    this.onlyOnChanges = false;
+    this.woken = true;
+    this.supervisor = system.__supervisor;
+    this.planWakes = [];
+    // A coroutine started between frames has to run although nothing this system looks at changed.
+    this.supervisor.onStart = () => {
+      if (this.onlyOnChanges) this.wake();
+    };
     this.shapeLogPointer = dispatcher.shapeLog.createPointer();
+    this.shapeTypeIds = [];
+    this.writeTypeIds = [];
+    this.shapePushesSeen = dispatcher.shapeLog.pushCount;
+    this.writePushesSeen = 0;
     STATS: this.stats = dispatcher.stats.forSystem(system.constructor as SystemType<any>);
     this.attachedSystems = this.system.__attachPlaceholders!.map(
       placeholder => this.dispatcher.systemsByClass.get(placeholder.type));
@@ -401,8 +427,18 @@ export class SystemBox {
 
   finishConstructing(): void {
     this.writeLogPointer = this.dispatcher.writeLog?.createPointer();
+    this.writePushesSeen = this.dispatcher.writeLog?.pushCount ?? 0;
     this.singletonStandingWrites =
       this.singletonStandingWrites.filter(type => type.__binding!.trackedWrites);
+    if (this.onlyOnChanges) {
+      CHECK: if (!this.shapeQueries.length) {
+        throw new CheckError(
+          `System ${this.name} runs only on changes but has no query that could see one`);
+      }
+      for (const typeId of new Set([...this.shapeTypeIds, ...this.writeTypeIds])) {
+        this.dispatcher.subscribeToChanges(typeId, this);
+      }
+    }
   }
 
   replacePlaceholders(): void {
@@ -444,8 +480,19 @@ export class SystemBox {
     this.trackStandingWrites();
   }
 
-  execute(time: number, delta: number): void {
-    if (this.state !== RunState.RUNNING) return;
+  /**
+   * Runs the system for one frame.
+   * @returns whether it ran; a system that was not woken leaves the logs as they are, so nothing
+   *   after it needs committing.
+   */
+  execute(time: number, delta: number): boolean {
+    if (this.state !== RunState.RUNNING) return false;
+    if (this.onlyOnChanges) {
+      // Fields of this box only: `this.system` is an instance of the user's own class, one shape
+      // per system, and reading through it in every frame would make this check the slow part.
+      if (!this.woken && this.supervisor.idle) return false;
+      this.woken = false;
+    }
     this.dispatcher.registry.executingSystem = this;
     this.system.time = time;
     this.system.delta = delta;
@@ -463,6 +510,31 @@ export class SystemBox {
       this.stats.lastExecutionDuration = time3 - time2;
       this.stats.lastCoroutinesDuration = time4 - time3;
     }
+    // A coroutine still running needs the next frame as well.
+    if (this.onlyOnChanges && !this.supervisor.idle) this.wake();
+    return true;
+  }
+
+  /**
+   * Wakes a system that runs only on changes, called just BEFORE an entry of one of its types is
+   * pushed. No entry of its types reached a log since it last ran or since it was last woken, so
+   * its pointers move to the head of both logs here, once, and the entry about to be pushed is the
+   * first it will read. A sleeping system therefore never touches the logs, and its pointers can
+   * never be lapped however long it sleeps.
+   */
+  wake(): void {
+    if (this.woken) return;
+    this.woken = true;
+    this.dispatcher.shapeLog.createPointer(this.shapeLogPointer);
+    this.shapePushesSeen = this.dispatcher.shapeLog.pushCount;
+    if (this.hasWriteQueries) {
+      this.dispatcher.writeLog!.createPointer(this.writeLogPointer!);
+      this.writePushesSeen = this.dispatcher.writeLog!.pushCount;
+    }
+    const planWakes = this.planWakes;
+    for (let i = 0; i < planWakes.length; i += 2) {
+      (planWakes[i] as SimplePlan).wakeAt(planWakes[i + 1] as number);
+    }
   }
 
   private trackStandingWrites() {
@@ -475,10 +547,24 @@ export class SystemBox {
   private runQueries(): void {
     const ranQueriesLastFrame = this.ranQueriesLastFrame;
     this.ranQueriesLastFrame = false;
-    const shapesChanged = this.dispatcher.shapeLog.hasUpdatesSince(this.shapeLogPointer);
-    const writesMade =
-      this.hasWriteQueries &&
-      this.dispatcher.writeLog!.hasUpdatesSince(this.writeLogPointer!);
+    const shapeLog = this.dispatcher.shapeLog;
+    let shapesChanged = shapeLog.hasUpdatesSince(this.shapeLogPointer);
+    if (shapesChanged && !shapeLog.hasPushesOf(this.shapeTypeIds, this.shapePushesSeen)) {
+      // The log grew only by types none of these queries looks at: move past them in one step.
+      shapeLog.createPointer(this.shapeLogPointer);
+      shapesChanged = false;
+    }
+    this.shapePushesSeen = shapeLog.pushCount;
+    let writesMade = false;
+    if (this.hasWriteQueries) {
+      const writeLog = this.dispatcher.writeLog!;
+      writesMade = writeLog.hasUpdatesSince(this.writeLogPointer!);
+      if (writesMade && !writeLog.hasPushesOf(this.writeTypeIds, this.writePushesSeen)) {
+        writeLog.createPointer(this.writeLogPointer!);
+        writesMade = false;
+      }
+      this.writePushesSeen = writeLog.pushCount;
+    }
     if (shapesChanged || writesMade || this.hasTransientQueries && ranQueriesLastFrame) {
       if (this.hasTransientQueries) {
         // Every write query is a shape query too.
@@ -615,6 +701,8 @@ export class SystemBox {
       }
       this.dispatcher.shapeLog.createPointer(this.shapeLogPointer);
       this.dispatcher.writeLog?.createPointer(this.writeLogPointer!);
+      this.shapePushesSeen = this.dispatcher.shapeLog.pushCount;
+      this.writePushesSeen = this.dispatcher.writeLog?.pushCount ?? 0;
     }
     this.state = RunState.RUNNING;
   }

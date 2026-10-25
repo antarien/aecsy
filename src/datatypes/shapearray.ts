@@ -2,9 +2,10 @@ import type {EntityId} from '../entity';
 import type {Buffers} from '../buffers';
 import type {ComponentType} from '../component';
 import type {ComponentEnum} from '../enums';
-import {InternalError} from '../errors';
-import type {TrackingMask} from 'src/query';
+import type {CompactMask, TrackingMask} from 'src/query';
 
+/* Every match walks only the non-zero words of its mask (`CompactMask`), so its cost follows the
+   number of component types a query names, never the id of the highest one. */
 export interface ShapeArray {
   syncThreads(): void;
   set(entityId: EntityId, type: ComponentType<any>): void;
@@ -12,20 +13,49 @@ export interface ShapeArray {
   isSet(entityId: EntityId, type: ComponentType<any>): boolean;
   get(entityId: number, enumeration: ComponentEnum): number;
   clear(): void;
-  match(entityId: EntityId, positiveMask: number[], positiveValues: number[]): boolean;
-  matchNot(entityId: EntityId, negativeMask: number[]): boolean;
+  match(entityId: EntityId, positive: CompactMask): boolean;
+  matchNot(entityId: EntityId, negative: CompactMask): boolean;
   matchAny(entityId: EntityId, trackingMask: TrackingMask): boolean;
+}
+
+
+/**
+ * A shape array cleared every cycle lists the words it wrote since the last clear, so clearing
+ * zeroes those words instead of the whole array: the array spans every entity times every component
+ * type, and a cycle writes the few that changed.
+ */
+class TouchedWords {
+  private readonly indices: number[] = [];
+
+  add(index: number): void {
+    this.indices.push(index);
+  }
+
+  clear(array: Uint32Array): void {
+    const indices = this.indices;
+    // Past an eighth of the array one contiguous fill is cheaper than the scattered writes.
+    if (indices.length > (array.length >>> 3)) {
+      array.fill(0);
+    } else {
+      for (let i = 0; i < indices.length; i++) array[indices[i]] = 0;
+    }
+    indices.length = 0;
+  }
 }
 
 
 export class UnsharedShapeArray implements ShapeArray {
   private readonly stride: number;
   private array: Uint32Array;
+  private readonly touched: TouchedWords | undefined;
 
-  constructor(bufferKey: string, numBits: number, maxEntities: number, buffers: Buffers) {
+  constructor(
+    bufferKey: string, numBits: number, maxEntities: number, buffers: Buffers, clearable = false
+  ) {
     this.stride = Math.ceil(numBits / 32);
     buffers.register(
       bufferKey, maxEntities * this.stride, Uint32Array, shapes => {this.array = shapes;});
+    if (clearable) this.touched = new TouchedWords();
   }
 
   syncThreads(): void {
@@ -39,6 +69,7 @@ export class UnsharedShapeArray implements ShapeArray {
     const value = binding.shapeValue;
     this.array[index] &= ~mask;
     this.array[index] |= value;
+    this.touched?.add(index);
   }
 
   unset(entityId: number, type: ComponentType<any>): void {
@@ -64,41 +95,43 @@ export class UnsharedShapeArray implements ShapeArray {
   }
 
   clear(): void {
-    this.array.fill(0);
+    if (this.touched) {
+      this.touched.clear(this.array);
+    } else {
+      this.array.fill(0);
+    }
   }
 
-  match(entityId: EntityId, positiveMask: number[], positiveValues: number[]): boolean {
-    DEBUG: if (positiveMask.length !== positiveValues.length) {
-      throw new InternalError(
-        `Mismatched mask and value lengths: ${positiveMask.length} vs ${positiveValues.length}`);
-    }
+  match(entityId: EntityId, positive: CompactMask): boolean {
     const array = this.array;
     const index = entityId * this.stride;
-    for (let i = 0; i < positiveMask.length; i++) {
-      if ((array[index + i] & positiveMask[i]) !== positiveValues[i]) return false;
+    const {offsets, masks, values} = positive;
+    for (let i = 0; i < offsets.length; i++) {
+      if ((array[index + offsets[i]] & masks[i]) !== values[i]) return false;
     }
     return true;
   }
 
-  matchNot(entityId: EntityId, negativeMask: number[]): boolean {
+  matchNot(entityId: EntityId, negative: CompactMask): boolean {
     const array = this.array;
     const index = entityId * this.stride;
-    for (let i = 0; i < negativeMask.length; i++) {
-      if ((array[index + i] & negativeMask[i]) !== 0) return false;
+    const {offsets, masks} = negative;
+    for (let i = 0; i < offsets.length; i++) {
+      if ((array[index + offsets[i]] & masks[i]) !== 0) return false;
     }
     return true;
   }
 
   matchAny(entityId: EntityId, trackingMask: TrackingMask): boolean {
     trackingMask.changed = false;
-    const mask = trackingMask.mask;
+    const {offsets, masks} = trackingMask.match!;
     const lastMatch =
       trackingMask.lastMatches![entityId] = trackingMask.lastMatches![entityId] || [];
     const array = this.array;
     const index = entityId * this.stride;
     let ok = false;
-    for (let i = 0; i < mask.length; i++) {
-      const masked = array[index + i] & mask[i];
+    for (let i = 0; i < offsets.length; i++) {
+      const masked = array[index + offsets[i]] & masks[i];
       if (masked !== 0) ok = true;
       if (masked !== lastMatch[i]) trackingMask.changed = true;
       lastMatch[i] = masked;
@@ -112,11 +145,15 @@ export class UnsharedShapeArray implements ShapeArray {
 export class AtomicSharedShapeArray implements ShapeArray {
   private readonly stride: number;
   private array: Uint32Array;
+  private readonly touched: TouchedWords | undefined;
 
-  constructor(bufferKey: string, numBits: number, maxEntities: number, buffers: Buffers) {
+  constructor(
+    bufferKey: string, numBits: number, maxEntities: number, buffers: Buffers, clearable = false
+  ) {
     this.stride = Math.ceil(numBits / 32);
     buffers.register(
       bufferKey, maxEntities * this.stride, Uint32Array, shapes => {this.array = shapes;});
+    if (clearable) this.touched = new TouchedWords();
   }
 
   syncThreads(): void {
@@ -131,6 +168,7 @@ export class AtomicSharedShapeArray implements ShapeArray {
     const value = binding.shapeValue;
     if (mask !== value) Atomics.and(this.array, index, ~mask);
     Atomics.or(this.array, index, value);
+    this.touched?.add(index);
   }
 
   unset(entityId: number, type: ComponentType<any>): void {
@@ -158,40 +196,42 @@ export class AtomicSharedShapeArray implements ShapeArray {
   }
 
   clear(): void {
-    this.array.fill(0);
+    if (this.touched) {
+      this.touched.clear(this.array);
+    } else {
+      this.array.fill(0);
+    }
   }
 
-  match(entityId: EntityId, positiveMask: number[], positiveValues: number[]): boolean {
-    DEBUG: if (positiveMask.length !== positiveValues.length) {
-      throw new InternalError(
-        `Mismatched mask and value lengths: ${positiveMask.length} vs ${positiveValues.length}`);
-    }
+  match(entityId: EntityId, positive: CompactMask): boolean {
     const array = this.array;
     const index = entityId * this.stride;
-    for (let i = 0; i < positiveMask.length; i++) {
-      if ((array[index + i] & positiveMask[i]) !== positiveValues[i]) return false;
+    const {offsets, masks, values} = positive;
+    for (let i = 0; i < offsets.length; i++) {
+      if ((array[index + offsets[i]] & masks[i]) !== values[i]) return false;
     }
     return true;
   }
 
-  matchNot(entityId: EntityId, negativeMask: number[]): boolean {
+  matchNot(entityId: EntityId, negative: CompactMask): boolean {
     const array = this.array;
     const index = entityId * this.stride;
-    for (let i = 0; i < negativeMask.length; i++) {
-      if ((array[index + i] & negativeMask[i]) !== 0) return false;
+    const {offsets, masks} = negative;
+    for (let i = 0; i < offsets.length; i++) {
+      if ((array[index + offsets[i]] & masks[i]) !== 0) return false;
     }
     return true;
   }
 
   matchAny(entityId: EntityId, trackingMask: TrackingMask): boolean {
     trackingMask.changed = false;
-    const mask = trackingMask.mask;
+    const {offsets, masks} = trackingMask.match!;
     const lastMatch =
       trackingMask.lastMatches![entityId] = trackingMask.lastMatches![entityId] || [];
     const array = this.array;
     const index = entityId * this.stride;
-    for (let i = 0; i < mask.length; i++) {
-      const masked = array[index + i] & mask[i];
+    for (let i = 0; i < offsets.length; i++) {
+      const masked = array[index + offsets[i]] & masks[i];
       if (masked === 0) {
         delete trackingMask.lastMatches![entityId];
         return false;

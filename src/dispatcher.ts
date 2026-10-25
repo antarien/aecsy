@@ -106,6 +106,8 @@ export class Dispatcher {
   state = State.init;
   readonly shapeLog: Log;
   readonly writeLog?: Log;
+  /** Per component type id, the systems that run only on changes and look at that type. */
+  private readonly changeSubscribers: (SystemBox[] | undefined)[] = [];
   private readonly shapeLogFramePointer: LogPointer;
   private readonly writeLogFramePointer?: LogPointer;
   readonly stats;
@@ -405,6 +407,21 @@ export class Dispatcher {
     this.stats.frames += 1;
     this.stats.maxShapeChangesPerFrame = this.shapeLog.countSince(this.shapeLogFramePointer);
     this.stats.maxWritesPerFrame = this.writeLog?.countSince(this.writeLogFramePointer!) ?? 0;
+  }
+
+  /** Registers a system that runs only on changes for entries of one component type. */
+  subscribeToChanges(typeId: number, system: SystemBox): void {
+    (this.changeSubscribers[typeId] ??= []).push(system);
+  }
+
+  /**
+   * Wakes the systems that run only on changes and look at the type of an entry about to be
+   * logged. Called before the push, so a woken system's pointers stand in front of that entry.
+   */
+  wake(typeId: number): void {
+    const subscribers = this.changeSubscribers[typeId];
+    if (!subscribers) return;
+    for (let i = 0; i < subscribers.length; i++) subscribers[i].wake();
   }
 
   flush(): void {
