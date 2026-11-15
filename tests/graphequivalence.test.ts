@@ -1,3 +1,9 @@
+/**
+ * Copyright (c) Jan Ohlmann. All rights reserved.
+ * Licensed to ANTARES SIMULACAO LTDA. Use is governed by LICENSE.md and PJV.md in this repository.
+ * SPDX-License-Identifier: LicenseRef-ASE-LIC
+ */
+
 import {Graph} from '../src/datatypes/graph';
 
 /* The dense matrix form of the graph, kept here as the reference: the edge form has to derive

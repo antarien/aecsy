@@ -1,5 +1,9 @@
 // We'll get either the dev or perf variant of becsy injected, but just take types from one since
 // they're exactly the same anyway.
+//
+// Copyright (c) Jan Ohlmann. All rights reserved.
+// Licensed to ANTARES SIMULACAO LTDA. Use is governed by LICENSE.md and PJV.md in this repository.
+// SPDX-License-Identifier: LicenseRef-ASE-LIC
 import type * as becsyDev from '../src/index';
 type Becsy = {
   field: typeof becsyDev.field,

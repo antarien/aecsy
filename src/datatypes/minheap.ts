@@ -1,3 +1,9 @@
+/**
+ * Copyright (c) Jan Ohlmann. All rights reserved.
+ * Licensed to ANTARES SIMULACAO LTDA. Use is governed by LICENSE.md and PJV.md in this repository.
+ * SPDX-License-Identifier: LicenseRef-ASE-LIC
+ */
+
 /** A binary min-heap of small non-negative integers, such as vertex ids or plan positions. */
 export class MinHeap {
   private readonly items: number[] = [];
